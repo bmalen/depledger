@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-stone-50 text-stone-900 antialiased dark:bg-stone-950 dark:text-stone-100;
+  }
+}
+
+/* Rendered markdown from the ledger (analysis docs, notes, review entries). */
+.prose-ledger {
+  @apply text-[0.925rem] leading-relaxed;
+}
+.prose-ledger h1,
+.prose-ledger h2,
+.prose-ledger h3,
+.prose-ledger h4 {
+  @apply mt-6 mb-2 font-semibold tracking-tight;
+}
+.prose-ledger h1 {
+  @apply text-xl;
+}
+.prose-ledger h2 {
+  @apply text-lg;
+}
+.prose-ledger h3 {
+  @apply text-base;
+}
+.prose-ledger p,
+.prose-ledger ul,
+.prose-ledger ol,
+.prose-ledger pre,
+.prose-ledger table {
+  @apply my-3;
+}
+.prose-ledger ul {
+  @apply list-disc pl-5;
+}
+.prose-ledger ol {
+  @apply list-decimal pl-5;
+}
+.prose-ledger li {
+  @apply my-1;
+}
+.prose-ledger a {
+  @apply text-teal-700 underline decoration-teal-700/30 underline-offset-2 hover:decoration-teal-700 dark:text-teal-400 dark:decoration-teal-400/30;
+}
+.prose-ledger code {
+  @apply rounded bg-stone-200/70 px-1 py-0.5 font-mono text-[0.85em] dark:bg-stone-800;
+}
+.prose-ledger pre {
+  @apply overflow-x-auto rounded-md bg-stone-900 p-3 text-stone-100 dark:bg-black/60;
+}
+.prose-ledger pre code {
+  @apply bg-transparent p-0 text-[0.8rem];
+}
+.prose-ledger table {
+  @apply block overflow-x-auto text-sm;
+}
+.prose-ledger th,
+.prose-ledger td {
+  @apply border border-stone-300 px-2 py-1 text-left align-top dark:border-stone-700;
+}
+.prose-ledger blockquote {
+  @apply border-l-4 border-stone-300 pl-3 text-stone-600 dark:border-stone-700 dark:text-stone-400;
+}
