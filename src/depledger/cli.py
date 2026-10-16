@@ -541,6 +541,40 @@ def cmd_export(conn, a):
     print('exported to %s' % out_dir)
 
 
+def git(args, cwd):
+    return subprocess.run(['git'] + args, cwd=cwd, capture_output=True, text=True, timeout=120)
+
+
+def cmd_backup(conn, a):
+    """Commit export/ in the git repo that holds it, then push. Only export/ is staged, so
+    nothing else in that repo is swept into the commit."""
+    out_dir = os.path.realpath(store.export(conn))
+    top = repo_mod.toplevel(out_dir)
+    if not top:
+        fail('%s is not inside a git repo; run `git init` in %s to back it up' % (out_dir, os.path.dirname(out_dir)))
+    rel = os.path.relpath(out_dir, os.path.realpath(top))
+    git(['add', '--', rel], top)
+    if git(['diff', '--cached', '--quiet', '--', rel], top).returncode == 0:
+        print('nothing to back up: %s matches the last commit' % rel)
+        return
+    stat = git(['diff', '--cached', '--shortstat', '--', rel], top).stdout.strip()
+    message = 'chore: ledger backup %s' % store.now()
+    r = git(['commit', '-q', '-m', message, '--', rel], top)
+    if r.returncode:
+        fail('git commit failed: %s' % (r.stderr or r.stdout).strip())
+    print('committed "%s" (%s)' % (message, stat))
+    if a.no_push:
+        return
+    upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], top)
+    if upstream.returncode:
+        print('no upstream branch in %s; the commit stays local' % top)
+        return
+    r = git(['push', '-q'], top)
+    if r.returncode:
+        fail('git push failed: %s' % (r.stderr or r.stdout).strip())
+    print('pushed to %s' % upstream.stdout.strip())
+
+
 # ---------------------------------------------------------------- parser
 
 def build_parser():
@@ -737,6 +771,10 @@ def build_parser():
     p = sub.add_parser('export', help='write every table as JSON Lines for a backup (every write does this too)')
     p.add_argument('--dir')
     p.set_defaults(f=cmd_export)
+
+    p = sub.add_parser('backup', help='commit export/ in the git repo that holds it, and push')
+    p.add_argument('--no-push', action='store_true', help='commit only')
+    p.set_defaults(f=cmd_backup)
     return ap
 
 

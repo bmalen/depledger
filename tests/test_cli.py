@@ -1,7 +1,9 @@
 import contextlib
 import io
 import os
+import subprocess
 import unittest
+from unittest import mock
 
 from helpers import LedgerTestCase
 
@@ -17,7 +19,7 @@ class CliTest(LedgerTestCase):
             if cwd:
                 os.chdir(cwd)
             cli.sys.stdin = io.StringIO(stdin)
-            with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stdout(out), mock.patch.object(cli, 'refresh_pr_states', return_value=[]):
                 cli.main(list(argv))
         finally:
             os.chdir(old_cwd)
@@ -57,6 +59,22 @@ class CliTest(LedgerTestCase):
         r = store.find_repo(self.conn, 'web')
         reviews = store.reviews_for_pr(self.conn, store.get_pr(self.conn, r['id'], 1402)['id'])
         self.assertEqual([(v['verdict'], v['tier'], v['body']) for v in reviews], [('safe', 1, '- Tier 1, safe.\n')])
+
+    def test_backup_commits_only_the_export_and_skips_when_nothing_changed(self):
+        subprocess.run(['git', 'init', '-q'], cwd=self.tmp.name, check=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=self.tmp.name, check=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=self.tmp.name, check=True)
+        self.run_cli('review', 'save', 'acme/web#7', '--verdict', 'safe', '--tier', '0', stdin='- fine\n')
+
+        first = self.run_cli('backup')
+        second = self.run_cli('backup')
+
+        committed = subprocess.run(['git', 'show', '--name-only', '--format=%s', 'HEAD'], cwd=self.tmp.name,
+                                   capture_output=True, text=True).stdout.split()
+        self.assertIn('no upstream branch', first)
+        self.assertIn('export/reviews.jsonl', committed)
+        self.assertNotIn('test.db', committed)
+        self.assertIn('nothing to back up', second)
 
     def test_parse_remote_and_pr_refs(self):
         self.assertEqual(repo.parse_remote('git@github.com:acme/api.git'), 'acme/api')
