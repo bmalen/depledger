@@ -47,6 +47,10 @@ Data lives in `$DEPLEDGER_HOME`, default `${XDG_DATA_HOME:-~/.local/share}/deple
 the ledger can be backed up and diffed in git) and the UI log. Set `DEPLEDGER_DB` to use a different
 database file; its export then goes beside it.
 
+To back the ledger up, put the data directory under git with a remote (a private repository: the
+ledger holds notes about your own projects), then run `depledger backup` now and then. It refreshes
+`export/`, commits only that folder and pushes. The database file itself does not need committing.
+
 ## Usage
 
 Run commands from inside a checkout of the repo the PR belongs to. Repo-scoped commands read the
@@ -94,3 +98,7 @@ their history across repos, repo notes, reviews, traps and patterns, digests, ac
 ```
 python3 -m unittest discover tests
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE).
