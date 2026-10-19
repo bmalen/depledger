@@ -58,6 +58,7 @@ repo from the `origin` remote (or `--repo owner/name`) and refuse to write anywh
 
 ```
 depledger triage 123 --out /tmp/pr-123          # fetch, parse, look everything up, propose a tier
+depledger checks --from /tmp/pr-123 --checkout   # run the local checks triage planned, on the PR head
 depledger review save owner/repo#123 --verdict safe --tier 1 < entry.md
 
 depledger show package @tiptap/core             # the package across every repo, with its analysis
@@ -69,6 +70,8 @@ depledger package doc npm axios --append < analysis.md
 depledger package exposure npm axios < check.sh
 depledger note add "Base branch is staging" --always
 depledger note add "Redis runs on phpredis" --when "predis/predis"
+depledger probe --from /tmp/pr-123             # probe and bank every image digest triage found
+depledger image edit ba6e394f6acc --append-notes "dev compose only"
 depledger image add redis:alpine@ba6e394f6acc --fact version=8.10.2 --fact os="Alpine 3.23"
 depledger action add actions/checkout v6.1.0 <sha> --type commit
 
@@ -86,6 +89,35 @@ lock-only movers, GitHub Actions pins (resolved through the API, both tag hops),
 against its base, the local environment, a proposed risk tier with the checks it needs, the standing
 traps, the matching repo notes, and the command to save the verdict. It is tuned for projects using
 npm or bun and composer, with Laravel Sail detected when present.
+
+It also prints what CI actually ran on the PR head (each GitHub Actions job with its longest steps
+and anything failed or skipped), and the other open PRs that change the same files, each merged
+against the base with this PR applied so that a conflict this PR causes is told apart from one the
+other PR already has. An analysed version that does not cover the bump (a newer patch, or an older
+major line) is marked on the package line.
+
+### Local checks
+
+When a PR needs local checks, triage writes `checks.json` beside its other output and prints the
+command. `depledger checks --from <dir> --checkout` checks out the PR head (refusing a dirty tree or
+local-only commits), then runs the frozen install for the repo's package manager (bun, pnpm, npm or
+yarn) and `composer install`, then build, typecheck and each command of the lint script with
+`--fix` stripped side by side, then the tests, inside Laravel Sail when the repo has it and on the
+host otherwise. Each step prints PASS or FAIL with its evidence: the lock left untouched, the files
+and errors eslint counted, the test summary. `--list` prints the plan, `--only` runs chosen steps,
+and `--here` runs on whatever is checked out for a baseline.
+
+### Image probes
+
+Triage writes every image change as full old and new refs to `probes.json` in its `--out` dir.
+`depledger probe --from <dir>` skips each pair whose new digest is already on record, runs the
+rest in parallel (`docker run` with a POSIX `sh` script, amd64 first), and prints one block per
+image: a class (`IDENTICAL`, `REBUILD ONLY`, `PACKAGE REFRESH`, `VERSION MOVE`), the runtime and
+Postgres extension versions that moved, and the PHP module and dpkg/apk/rpm package deltas. Both
+digests are banked with the same fact keys every time, the new one with the delta as its notes.
+Dumps are cached by digest under `<data dir>/probes` (`DEPLEDGER_PROBE_DIR`), so a digest is pulled
+once per machine. `depledger probe <old-ref> <new-ref>` does one pair, `--no-bank` writes nothing,
+and `scripts/probe-image.sh` is a print-only wrapper around it.
 
 ## Web UI
 

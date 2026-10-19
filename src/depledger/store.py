@@ -627,6 +627,24 @@ def add_image(conn, image, tag, digest, facts=None, notes='', line=''):
     return one(conn.execute('SELECT * FROM image_digests WHERE id = ?', (rid,))), True
 
 
+def edit_image(conn, image_id, facts=None, drop_facts=(), notes=None, append_notes=None, line=None, tag=None):
+    """Merge facts, replace or append notes, retag. Every change keeps the old row in revisions."""
+    row = one(conn.execute('SELECT * FROM image_digests WHERE id = ?', (image_id,)))
+    if not row:
+        raise StoreError('no image record %s' % image_id)
+    merged = json.loads(row['facts'] or '{}')
+    merged.update(facts or {})
+    for k in drop_facts or ():
+        merged.pop(k, None)
+    new_notes = row['notes'] if notes is None else notes
+    if append_notes:
+        new_notes = (new_notes.rstrip() + ' ' + append_notes.strip()).strip()
+    conn.execute('UPDATE image_digests SET facts = ?, notes = ?, line = ?, tag = ?, updated_at = ? WHERE id = ?',
+                 (json.dumps(merged), new_notes, row['line'] if line is None else line,
+                  row['tag'] if tag is None else tag, now(), image_id))
+    return one(conn.execute('SELECT * FROM image_digests WHERE id = ?', (image_id,)))
+
+
 def find_action(conn, sha, action=None):
     sha = (sha or '')[:12]
     if len(sha) < 7:

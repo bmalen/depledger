@@ -370,19 +370,77 @@ def cmd_action_add(conn, a):
         fail('%s %s is on record as %s, not %s: a moved tag? Check it before changing the ledger' % (row['action'], row['tag'], row['sha'], a.sha))
 
 
-def cmd_image_add(conn, a):
-    m = re.match(r'^(.+?)(?::([^@:/]+))?@(?:sha256:)?([0-9a-f]{12,64})$', a.ref)
-    if not m:
-        fail('expected <image>[:<tag>]@<digest>, got %r' % a.ref)
+def parse_facts(pairs):
     facts = {}
-    for f in a.fact or ():
+    for f in pairs or ():
         if '=' not in f:
             fail('--fact takes key=value, got %r' % f)
         k, v = f.split('=', 1)
         facts[k.strip()] = v.strip()
+    return facts
+
+
+def cmd_image_add(conn, a):
+    m = re.match(r'^(.+?)(?::([^@:/]+))?@(?:sha256:)?([0-9a-f]{12,64})$', a.ref)
+    if not m:
+        fail('expected <image>[:<tag>]@<digest>, got %r' % a.ref)
     with store.write(conn):
-        row, added = store.add_image(conn, m.group(1), m.group(2) or '', m.group(3), facts, a.notes or '', a.line or '')
-    print('%s %s:%s %s' % ('added' if added else 'already on record:', row['image'], row['tag'], row['digest12']))
+        row, added = store.add_image(conn, m.group(1), m.group(2) or '', m.group(3), parse_facts(a.fact), a.notes or '', a.line or '')
+    print('%s %s:%s %s' % ('added' if added else 'already on record (change it with `depledger image edit`):', row['image'], row['tag'], row['digest12']))
+
+
+def cmd_image_edit(conn, a):
+    hits = store.find_digest(conn, a.ref.rsplit('@', 1)[-1])
+    if not hits:
+        fail('no image record for %r (12 or more hex characters of the digest, or the full ref)' % a.ref)
+    if a.notes is not None and a.append_notes:
+        fail('use --notes or --append-notes, not both')
+    with store.write(conn):
+        row = store.edit_image(conn, hits[0]['id'], facts=parse_facts(a.fact), drop_facts=a.drop_fact or (),
+                               notes=a.notes, append_notes=a.append_notes, line=a.line, tag=a.tag)
+    print('updated %s:%s %s' % (row['image'], row['tag'], row['digest12']))
+
+
+def cmd_checks(conn, a):
+    from . import checks
+    path = os.path.join(a.from_dir, 'checks.json')
+    if not os.path.exists(path):
+        fail('%s not found: run `depledger triage <pr> --out %s` from the repo first (it writes the plan when NEEDS_CHECKOUT=yes)' % (path, a.from_dir))
+    with open(path) as f:
+        p = json.load(f)
+    if a.list:
+        for s in p['steps']:
+            print('%s %-16s phase %d  %s' % ('*' if s['selected'] else ' ', s['name'], s['phase'], s['cmd']))
+        print('(* = selected by triage; run others with --only <name>)')
+        return
+    only = [o.strip() for o in a.only.split(',')] if a.only else None
+    if a.here and a.checkout:
+        fail('use --checkout (the PR head) or --here (a baseline on what is checked out), not both')
+    if checks.run_plan(p, a.from_dir, only=only, do_checkout=a.checkout, here=a.here):
+        sys.exit(1)
+
+
+def cmd_probe(conn, a):
+    from . import probe
+    if a.from_dir:
+        path = os.path.join(a.from_dir, 'probes.json')
+        if not os.path.exists(path):
+            fail('%s not found: run `depledger triage <pr> --out %s` first' % (path, a.from_dir))
+        with open(path) as f:
+            pairs = [(p['label'], p['old'], p['new']) for p in json.load(f)]
+    elif len(a.refs) == 1:
+        pairs = [(a.refs[0].rsplit('@', 1)[0], None, a.refs[0])]
+    elif len(a.refs) == 2:
+        pairs = [(a.refs[1].rsplit('@', 1)[0], a.refs[0], a.refs[1])]
+    else:
+        fail('give --from <triage out dir>, or one ref, or an old and a new ref')
+    if not pairs:
+        print('no image changes to probe')
+        return
+    failures = probe.probe_pairs(conn, pairs, platform=a.platform, refresh=a.refresh, do_bank=not a.no_bank)
+    if failures:
+        print('FAILED=%d' % failures)
+        sys.exit(1)
 
 
 def note_tags(a):
@@ -396,7 +454,7 @@ def cmd_note_add(conn, a):
     if tags is None:
         fail('say when the note matters: --when "<bucket, package or glob, branch, text>" or --always (printed on every triage of the repo, keep these few)')
     r = repo_mod.resolve(conn, a.repo)
-    body = stdin_text()
+    body = stdin_text() if (a.slug or a.append) else ''
     with store.write(conn):
         existing = store.get_note(conn, r['id'], a.slug) if a.slug else None
         nid = store.add_note(conn, r['id'], a.gist, tags, slug=a.slug, body=body or None, append=a.append)
@@ -718,10 +776,35 @@ def build_parser():
     s.add_argument('--notes')
     s.add_argument('--line', help='image line, e.g. "php8.4 line"')
     s.set_defaults(f=cmd_image_add)
+    s = ims.add_parser('edit', help='change a banked digest: merge facts, replace or append notes')
+    s.add_argument('ref', help='the digest (12+ hex) or the full <image>[:<tag>]@<digest>')
+    s.add_argument('--fact', action='append', help='key=value, added or overwritten')
+    s.add_argument('--drop-fact', action='append', help='a fact key to remove')
+    s.add_argument('--notes', help='replace the notes')
+    s.add_argument('--append-notes', help='add to the end of the notes')
+    s.add_argument('--line')
+    s.add_argument('--tag')
+    s.set_defaults(f=cmd_image_edit)
+
+    p = sub.add_parser('checks', help="run the PR's local checks from the plan triage wrote (install, build, typecheck, lint without --fix, tests)")
+    p.add_argument('--from', dest='from_dir', required=True, help='the triage --out dir holding checks.json')
+    p.add_argument('--checkout', action='store_true', help='check out the PR head first (refuses on a dirty tree or local-only commits)')
+    p.add_argument('--only', help='comma list of step or check names (prefixes work: lint, install), selected or not')
+    p.add_argument('--here', action='store_true', help='run on whatever is checked out (the base, for a baseline) instead of requiring the PR head')
+    p.add_argument('--list', action='store_true', help='print the plan without running it')
+    p.set_defaults(f=cmd_checks)
+
+    p = sub.add_parser('probe', help='probe image digests, bank their facts and print what moved')
+    p.add_argument('refs', nargs='*', help='<image>[:<tag>]@sha256:<digest>: one to describe it, old and new to compare')
+    p.add_argument('--from', dest='from_dir', help="a triage --out dir: probe every pair in its probes.json whose new digest is not on record")
+    p.add_argument('--platform', help='default: amd64, then arm64, from the manifest')
+    p.add_argument('--refresh', action='store_true', help='re-run cached probes and merge their facts into existing records')
+    p.add_argument('--no-bank', action='store_true', help='print only, write nothing to the ledger')
+    p.set_defaults(f=cmd_probe)
 
     p = sub.add_parser('note', help="a repo's standing facts")
     ns = p.add_subparsers(dest='action', required=True)
-    s = ns.add_parser('add', help='add a note (or update the note with --slug), body on stdin')
+    s = ns.add_parser('add', help='add a note (or update the note with --slug, body on stdin)')
     s.add_argument('gist')
     s.add_argument('--when', help='comma list: bucket, package name or glob, branch, or text in the title/signals')
     s.add_argument('--always', action='store_true', help='print on every triage of the repo')

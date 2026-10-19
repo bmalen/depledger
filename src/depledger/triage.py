@@ -16,11 +16,14 @@ import json
 import os
 import re
 
+from . import checks as checks_mod
+from . import ci
+from . import probe
 from . import repo as repo_mod
 from . import store
-from .parse import (BUILD_CHAIN, HEX40, bump_type, bumps, collect_changes, fetch_pr, is_major_like,
-                    lock_only_movers, out, parse_arg, parse_diff, release_notes, renovate_table, run,
-                    section, short, ver_parts)
+from .parse import (BUILD_CHAIN, HEX40, bump_type, bumps, collect_changes, coverage, coverage_note, fetch_pr,
+                    is_major_like, lock_only_movers, out, parse_arg, parse_diff, release_notes,
+                    release_notes_for, renovate_table, run, section, short, ver_parts)
 
 def cwd_repo():
     """(owner/name, toplevel) of the cwd, or ('', None)."""
@@ -107,6 +110,10 @@ def main(argv=None):
         print('- (no checks reported)')
     print('CI_FAILED=%s' % (','.join(failed) or 'none'))
     print('CI_PENDING=%s' % (','.join(pending) or 'none'))
+    if pr.get('headRefOid') and pr.get('statusCheckRollup'):
+        print('CI steps on head %s (longest real steps; a short or skipped step is a blind spot):' % pr['headRefOid'][:8])
+        for line in ci.ci_steps(repo, pr['headRefOid']):
+            print(line)
     if artifacts_failed:
         print('NOTE: renovate/artifacts failed -> the lock was probably not generated; all-red frozen installs downstream are NOT test failures.')
 
@@ -170,6 +177,9 @@ def main(argv=None):
 
     def history_line(h, with_repo):
         verdict = h['verdict'] or ('no verdict' if h['review_id'] else 'triaged only')
+        if h['verdict_text'] and h['verdict'] in ('not_safe', 'safe'):
+            text = ' '.join(h['verdict_text'].split())
+            verdict += ' "%s"' % (text if len(text) <= 90 else text[:87] + '...')
         when = (h['reviewed_at'] or h['triaged_at'] or '')[:10]
         where = '%s#%s' % (h['repo'], h['number']) if with_repo else '#%s' % h['number']
         return '%s %s %s -> %s %s%s' % (where, h['name'], h['from_version'] or '?', h['to_version'] or '?', verdict,
@@ -233,7 +243,7 @@ def main(argv=None):
         print('(no manifest changes)')
     for p in pkgs:
         idx = p['index']
-        status = ('%s @%s' % (idx['status'], idx['analysed'])) if idx else 'not in ledger'
+        status = ('%s @%s%s' % (idx['status'], idx['analysed'], coverage_note(p['new'], idx['analysed']))) if idx else 'not in ledger'
         print('- %s %s: %s -> %s  [%s] section=%s  ledger=%s' % (p['eco'], p['name'], p['old'], p['new'], p['type'], p['section'], status))
         if idx:
             print_ledger_detail(idx)
@@ -241,11 +251,7 @@ def main(argv=None):
             print('    prior reviews here: %s' % ' | '.join(p['reviews']))
         if p['elsewhere']:
             print('    elsewhere: %s' % ' | '.join(p['elsewhere']))
-        n = None
-        for k, v in notes.items():
-            if p['name'].lower() in k.lower() or k.lower().split(' ')[0] in p['name'].lower():
-                n = v
-                break
+        n = release_notes_for(p['name'], notes)
         if n:
             print('    release notes: %d lines, %d breaking-ish keyword hits -> %s' % (n[0], n[1], n[2]))
         else:
@@ -289,7 +295,7 @@ def main(argv=None):
         real = lock_name.get((lock, name), name)
         row = store.lookup(index_rows, real, 'npm' if lock == 'bun.lock' else 'composer')
         lock_rows[(lock, name)] = row
-        tag = (' ledger=%s @%s' % (row['status'], row['analysed'])) if row else ''
+        tag = (' ledger=%s @%s%s' % (row['status'], row['analysed'], coverage_note(n, row['analysed']))) if row else ''
         print('- %s %s: %s -> %s [%s]%s' % (lock, name, o, n, bump_type(o, n), tag))
         if row and row['status'] in ('CHECK', 'TRAP'):
             print_ledger_detail(row)
@@ -445,8 +451,14 @@ def main(argv=None):
             rc, o2, _ = run(['git', 'grep', '-l', '-E', r'^FROM\s+(--platform=\S+\s+)?' + re.escape(name) + r'[:@]', 'origin/' + head], timeout=20)
             stacked = [l.split(':', 1)[1] for l in o2.splitlines()]
             if stacked:
-                print('    Dockerfiles with FROM %s: %s  (stacked layers -> probe-image.sh / local rebuild; CI never builds these)' % (name, ', '.join(stacked)))
+                print('    Dockerfiles with FROM %s: %s  (stacked layers -> local rebuild when the probe says packages moved; CI never builds these)' % (name, ', '.join(stacked)))
                 image_stacked.append(key)
+    if images:
+        with open(os.path.join(outdir, 'probes.json'), 'w') as f:
+            json.dump(probe.pairs_from_images(images), f, indent=1)
+    if image_needs_probe:
+        print("PROBE: depledger probe --from '%s'   (new digests not on record: %s; probes in parallel, banks facts, skips digests on record)"
+              % (outdir, ','.join(image_needs_probe)))
     if image_only_in_workflows:
         print('NOTE: every image change sits in .github/ -> a docker pin wearing a ci-actions path; treat as docker-image, SHA-pin resolution N/A.')
 
@@ -545,6 +557,14 @@ def main(argv=None):
     else:
         print('(git checks skipped: %s)' % ('repo mismatch, cwd is %s' % (cur_repo or 'not a gh repo') if not repo_match else 'fetch failed or --no-git'))
 
+    # ---------------- other open PRs
+    section('Other open PRs on the same files')
+    new_digests = [v['+']['digest'] for v in images.values() if v.get('+', {}).get('digest')]
+    other_lines, other_conflicts = ci.other_open_prs(repo, num, pr.get('headRefOid') or '', base, paths, new_digests, git_ok)
+    for line in other_lines:
+        print(line)
+    print('OTHER_PR_CONFLICTS=%s' % (','.join('#%s' % n for n in other_conflicts) or 'none'))
+
     # ---------------- environment
     section('Environment')
     uses_sail = os.path.exists('vendor/bin/sail')
@@ -615,8 +635,9 @@ def main(argv=None):
             bump(1, '%s is a CHECK row (re-run its exposure check)' % p['name'])
         elif not idx and p['type'].startswith('minor') and p['section'] in ('dependencies', 'require'):
             bump(1, '%s: unknown runtime package, minor bump' % p['name'])
-        elif idx and p['type'] != 'digest' and idx['analysed'] not in ('any', 'see gist') and ver_parts(p['new']) > ver_parts(idx['analysed']) and p['type'].startswith('minor') and p['section'] in ('dependencies', 'require'):
-            bump(1, '%s %s is past the analysed %s (runtime, minor)' % (p['name'], p['new'], idx['analysed']))
+        elif idx and p['type'] != 'digest' and coverage(p['new'], idx['analysed']) in ('past', 'other-line') and p['type'].startswith('minor') and p['section'] in ('dependencies', 'require'):
+            bump(1, '%s %s is %s the analysed %s (runtime, minor)' % (
+                p['name'], p['new'], 'past' if coverage(p['new'], idx['analysed']) == 'past' else 'on another line than', idx['analysed']))
     for lock, name, o, n in lock_only:
         row = lock_rows.get((lock, name))
         if is_major_like(bump_type(o, n)):
@@ -693,7 +714,17 @@ def main(argv=None):
     for r in reasons:
         print('- ' + r)
     print('CHECKS=%s' % (','.join(checks) or 'none (diff read + CI only)'))
-    print('NEEDS_CHECKOUT=%s' % ('yes' if any(c for c in checks if c not in ('probe-image', 'rebuild-stacked')) else 'no'))
+    needs_checkout = any(c for c in checks if c not in ('probe-image', 'rebuild-stacked'))
+    print('NEEDS_CHECKOUT=%s' % ('yes' if needs_checkout else 'no'))
+    if needs_checkout and repo_match:
+        env = {'top': cur_top or os.getcwd(), 'pm': js_pm, 'lock': js_lock if js_lock != 'none' else None, 'scripts': scripts,
+               'uses_sail': uses_sail, 'sail_up': sail_up, 'has_composer': os.path.exists('composer.json'),
+               'has_artisan': os.path.exists('artisan')}
+        plan = checks_mod.write_plan(outdir, checks_mod.plan(env, checks, [p['name'] for p in pkgs]),
+                                     {'repo': repo, 'number': num, 'head_sha': pr.get('headRefOid'), 'head_ref': head})
+        runs = [s['name'] for s in plan['steps'] if s['selected']]
+        print("RUN_CHECKS: depledger checks --from '%s' --checkout   (runs %s%s)" % (
+            outdir, ', '.join(runs) or 'nothing automatable', '; by hand: ' + ', '.join(plan['manual']) if plan['manual'] else ''))
 
     if traps:
         section('Standing traps (symptom-keyed; `depledger show pattern <slug>` for the detail)')

@@ -1,4 +1,5 @@
 """Pure parsing helpers shared by triage and the markdown migration: no ledger access."""
+import html
 import json
 import os
 import re
@@ -60,6 +61,34 @@ def ver_parts(v):
         else:
             break
     return parts
+
+
+def release_line(parts):
+    """The part of a version that names its release line: the major, or 0.minor below 1.0."""
+    if not parts:
+        return ()
+    return (0, parts[1]) if parts[0] == 0 and len(parts) > 1 else (parts[0],)
+
+
+def coverage(new, analysed):
+    """Whether a package row's `analysed` version covers a bump to `new`: 'covered', 'past'
+    (newer on the same line, or a later line), 'other-line' (an older line the row never
+    reviewed: vite 6.4.4 against a row analysed at 8.3.4), or 'unknown'."""
+    n, a = ver_parts(new or ''), ver_parts(analysed or '')
+    if not n or not a:
+        return 'unknown'
+    if release_line(n) < release_line(a):
+        return 'other-line'
+    return 'covered' if n <= a else 'past'
+
+
+def coverage_note(new, analysed):
+    c = coverage(new, analysed)
+    if c == 'past':
+        return ' (%s is past it)' % new
+    if c == 'other-line':
+        return ' (that is the %s line: %s is not covered)' % ('.'.join(map(str, release_line(ver_parts(analysed)))) + '.x', new)
+    return ''
 
 
 def bump_type(old, new):
@@ -232,7 +261,7 @@ def release_notes(body, outdir):
     kw = re.compile(r'(?i)\bbreaking\b|\bremov(ed|es|al)\b|\bdropp?(ed|s)? support\b|\brenamed?\b|'
                     r'no longer|minimum (supported )?(php|node|version)|requires? (php|node) |deprecat')
     for m in re.finditer(r'<details>\s*<summary>(.*?)</summary>(.*?)</details>', body, re.S):
-        name = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        name = html.unescape(re.sub(r'<[^>]+>', '', m.group(1))).replace('​', '').strip()
         text = m.group(2)
         slug = re.sub(r'[^A-Za-z0-9.-]+', '-', name).strip('-')[:60]
         path = os.path.join(outdir, 'notes-%s.md' % slug)
@@ -242,6 +271,21 @@ def release_notes(body, outdir):
         res[name] = (text.count('\n'), hits, path)
     truncated = bool(re.search(r'(?i)truncated|release notes.*too long', body))
     return res, truncated
+
+
+def release_notes_for(package, notes):
+    """The notes block for one package. Renovate titles a block `owner/repo (package)`, or just
+    `owner/repo` when the two share a name, so match the package exactly, never as a substring:
+    `vite` must not take `getsentry/sentry-javascript (@sentry/vite-plugin)`."""
+    want = package.lower()
+    for k, v in notes.items():
+        m = re.match(r'^(\S+)(?:\s+\((.+)\))?$', k.strip())
+        if not m:
+            continue
+        repo, named = m.group(1).lower(), (m.group(2) or '').lower()
+        if named == want or (not named and want in (repo, repo.rsplit('/', 1)[-1])):
+            return v
+    return None
 
 
 # ---------------------------------------------------------------- whole-diff summaries
