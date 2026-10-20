@@ -799,7 +799,7 @@ def build_parser():
     p.add_argument('--from', dest='from_dir', help="a triage --out dir: probe every pair in its probes.json whose new digest is not on record")
     p.add_argument('--platform', help='default: amd64, then arm64, from the manifest')
     p.add_argument('--refresh', action='store_true', help='re-run cached probes and merge their facts into existing records')
-    p.add_argument('--no-bank', action='store_true', help='print only, write nothing to the ledger')
+    p.add_argument('--no-bank', action='store_true', help='print only: probe digests on record too, write nothing to the ledger')
     p.set_defaults(f=cmd_probe)
 
     p = sub.add_parser('note', help="a repo's standing facts")

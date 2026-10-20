@@ -81,11 +81,11 @@ class CompareTest(LedgerTestCase):
 
 class ProbePairsTest(LedgerTestCase):
 
-    def run_pairs(self, pairs, results):
+    def run_pairs(self, pairs, results, **kw):
         out = io.StringIO()
         with mock.patch.object(probe, 'run_probe', side_effect=lambda ref, *a: dict(results[ref], ref=ref)) as run, \
                 contextlib.redirect_stdout(out):
-            failures = probe.probe_pairs(self.conn, pairs)
+            failures = probe.probe_pairs(self.conn, pairs, **kw)
         return out.getvalue(), failures, run
 
     def test_banks_both_sides_with_the_delta_on_the_new_record(self):
@@ -109,6 +109,24 @@ class ProbePairsTest(LedgerTestCase):
 
         run.assert_not_called()
         self.assertIn('pass (ledger): php=8.4.26', out)
+
+    def test_print_only_probes_a_digest_on_record_and_writes_nothing(self):
+        with store.write(self.conn):
+            store.add_image(self.conn, 'ghcr.io/acme/php', 'php8.4', 'b' * 64, {'php': '8.4.26'})
+
+        out, _, run = self.run_pairs([('ghcr.io/acme/php:php8.4', OLD, NEW)], {OLD: dump(CADDY_OLD), NEW: dump(CADDY_OLD)},
+                                     do_bank=False)
+
+        self.assertEqual(run.call_count, 2)
+        self.assertIn('IDENTICAL', out)
+        self.assertEqual(store.find_digest(self.conn, 'a' * 12), [])
+
+    def test_a_missing_docker_is_a_failed_probe_not_a_crash(self):
+        with mock.patch.dict(os.environ, {'DEPLEDGER_PROBE_DIR': self.tmp.name}), \
+                mock.patch.object(probe.subprocess, 'run', side_effect=FileNotFoundError(2, 'No such file or directory', 'docker')):
+            result = probe.run_probe(NEW, platform='linux/amd64')
+
+        self.assertIn('docker did not start', result['error'])
 
     def test_a_failed_probe_is_reported_and_nothing_is_banked(self):
         out, failures, _ = self.run_pairs([('x', OLD, NEW)], {OLD: dump(CADDY_OLD), NEW: {'error': 'exit 1 (platform linux/amd64): no stderr'}})

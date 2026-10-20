@@ -158,6 +158,8 @@ def run_probe(ref, platform=None, refresh=False):
             p = subprocess.run(args, input=INSIDE, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:
             return {'ref': ref, 'error': 'timed out after 900s'}
+        except OSError as e:
+            return {'ref': ref, 'error': 'docker did not start: %s' % e}
         if p.returncode != 0 or '---PACKAGES---' not in p.stdout:
             tail = ' | '.join(l for l in p.stderr.strip().splitlines()[-3:]) or 'no stderr'
             return {'ref': ref, 'error': 'exit %d (platform %s): %s' % (p.returncode, plat or 'default', tail)}
@@ -240,11 +242,11 @@ def fact_line(facts):
 
 def probe_pairs(conn, pairs, platform=None, refresh=False, do_bank=True, workers=4):
     """pairs: [(label, old_ref or None, new_ref)]. Prints one block per pair and returns the
-    number of failed probes. A pair whose new digest is already on record is skipped."""
+    number of failed probes. When banking, a pair whose new digest is already on record is skipped."""
     todo, failures = [], 0
     for label, old, new in pairs:
         hits = store.find_digest(conn, parse_ref(new)[2])
-        if hits and not refresh:
+        if hits and do_bank and not refresh:
             print('### %s  pass (ledger): %s' % (label, fact_line(json.loads(hits[0]['facts'] or '{}')) or hits[0]['notes']))
         else:
             todo.append((label, old, new))

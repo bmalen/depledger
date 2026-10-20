@@ -116,8 +116,8 @@ image: a class (`IDENTICAL`, `REBUILD ONLY`, `PACKAGE REFRESH`, `VERSION MOVE`),
 Postgres extension versions that moved, and the PHP module and dpkg/apk/rpm package deltas. Both
 digests are banked with the same fact keys every time, the new one with the delta as its notes.
 Dumps are cached by digest under `<data dir>/probes` (`DEPLEDGER_PROBE_DIR`), so a digest is pulled
-once per machine. `depledger probe <old-ref> <new-ref>` does one pair, `--no-bank` writes nothing,
-and `scripts/probe-image.sh` is a print-only wrapper around it.
+once per machine. `depledger probe <old-ref> <new-ref>` does one pair, `--no-bank` probes digests
+on record too and writes nothing, and `scripts/probe-image.sh` is a print-only wrapper around it.
 
 ## Web UI
 

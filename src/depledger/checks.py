@@ -3,7 +3,7 @@
 Triage writes the plan (checks.json in its --out dir) from what it already knows: the package
 manager and lock, the package.json scripts, whether the repo uses Sail, composer and artisan. The
 runner executes it on the checked-out PR head: installs first, then build, typecheck and lint
-(without --fix) side by side, then tests, inside Sail when the repo uses it. Each check prints
+(without --fix) side by side, then tests one run at a time, inside Sail when the repo uses it. Each check prints
 one PASS/FAIL line with the evidence (lock untouched, files and errors linted, tests passed).
 """
 import json
@@ -273,10 +273,11 @@ def run_plan(p, out_dir, only=None, do_checkout=False, here=False, executor=None
         ok, summary = judge(step, rc, so, se, lock_dirty)
         return step, ok, summary, int(time.time() - t0), log
 
+    # Test runs go one at a time: a serial and a --parallel run share the app's Redis, storage and CPU.
     results = []
     for phase in (1, 2, 3):
         batch = [s for s in steps if s['phase'] == phase]
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=1 if phase == 3 else 4) as ex:
             results += list(ex.map(one, batch))
     failures = 0
     for step, ok, summary, secs, log in results:

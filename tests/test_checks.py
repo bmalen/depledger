@@ -6,6 +6,8 @@ import os
 import pkgutil
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -183,6 +185,25 @@ class RunPlanTest(unittest.TestCase):
         self.assertIn('FAIL install-js', out)
         self.assertIn('install rewrote bun.lock', out)
 
+    def test_test_runs_never_overlap(self):
+        p = checks.plan(env(self.top, uses_sail=False), ['tests'], moved=['phpunit/phpunit'])
+        p = dict(p, repo='a/b', number=1, head_sha=self.head, head_ref='renovate/x')
+        running, overlapped, lock = [], [], threading.Lock()
+
+        def fake(cmd):
+            with lock:
+                running.append(cmd)
+                overlapped.append(len(running) > 1)
+            time.sleep(0.05)
+            with lock:
+                running.remove(cmd)
+            return SimpleNamespace(returncode=0, stdout='Tests:    3 passed', stderr='')
+
+        failures, _ = self.run_plan(p, fake)
+
+        self.assertEqual(failures, 0)
+        self.assertEqual(overlapped, [False, False])
+
     def test_refuses_to_run_on_another_head_without_checkout(self):
         failures, out = self.run_plan(self.make_plan(head='f' * 40), lambda cmd: None)
 
@@ -255,3 +276,27 @@ class ConflictWithTest(unittest.TestCase):
             self.assertEqual(ci.conflict_with(base, merged, rival, cwd=self.d), ('new', ['a.txt']))
             self.assertEqual(ci.conflict_with(base, merged, stale, cwd=self.d), ('stale', ['b.txt']))
             self.assertEqual(self.git('status', '--porcelain'), '')
+
+
+class FetchPrHeadsTest(unittest.TestCase):
+
+    def git(self, cwd, *args):
+        return subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t'] + list(args), cwd=cwd, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_fetches_the_missing_heads_and_survives_a_bad_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            origin, clone = os.path.join(d, 'origin'), os.path.join(d, 'clone')
+            os.makedirs(origin)
+            self.git(origin, 'init', '-q')
+            self.git(origin, 'commit', '-q', '--allow-empty', '-m', 'base')
+            heads = {}
+            for n in (1, 2):
+                self.git(origin, 'commit', '-q', '--allow-empty', '-m', 'pr %d' % n)
+                heads[n] = self.git(origin, 'rev-parse', 'HEAD')
+                self.git(origin, 'update-ref', 'refs/pull/%d/head' % n, 'HEAD')
+                self.git(origin, 'reset', '-q', '--hard', 'HEAD~1')
+            self.git(d, 'clone', '-q', '--no-local', origin, clone)
+            self.assertFalse(ci.have_commit(heads[1], cwd=clone))
+
+            self.assertEqual(ci.fetch_pr_heads({**heads, 3: 'f' * 40}, cwd=clone), {1, 2})

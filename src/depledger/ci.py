@@ -79,12 +79,20 @@ def overlapping(prs, number, files, new_digests):
     return found
 
 
-def fetch_pr_head(number):
-    rc, _, _ = run(['git', 'fetch', '-q', 'origin', 'pull/%s/head' % number], timeout=120)
-    if rc != 0:
-        return None
-    rc, o, _ = run(['git', 'rev-parse', 'FETCH_HEAD'], timeout=10)
-    return o.strip() if rc == 0 else None
+def have_commit(sha, cwd=None):
+    return bool(sha) and run(['git', 'cat-file', '-e', sha + '^{commit}'], timeout=10, cwd=cwd)[0] == 0
+
+
+def fetch_pr_heads(heads, cwd=None):
+    """heads: {number: head sha}. Fetches the heads not already local in one round trip (one PR at a
+    time only if that fails) and returns the numbers whose head is local afterwards."""
+    missing = [n for n, sha in heads.items() if not have_commit(sha, cwd)]
+    if missing:
+        rc, _, _ = run(['git', 'fetch', '-q', 'origin'] + ['pull/%s/head' % n for n in missing], timeout=300, cwd=cwd)
+        if rc != 0:
+            for n in missing:
+                run(['git', 'fetch', '-q', 'origin', 'pull/%s/head' % n], timeout=120, cwd=cwd)
+    return {n for n, sha in heads.items() if have_commit(sha, cwd)}
 
 
 def merge_conflicts(a, b, cwd=None):
@@ -129,7 +137,7 @@ def conflict_with(base_sha, merged_sha, other_sha, cwd=None):
 def other_open_prs(repo, number, head_sha, base_ref, files, new_digests, git_ok):
     """Lines for the 'Other open PRs' section, plus the numbers of PRs this one conflicts with."""
     rc, o, e = run(['gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '60',
-                    '--json', 'number,title,author,headRefName,files,isDraft'], timeout=120)
+                    '--json', 'number,title,author,headRefName,headRefOid,files,isDraft'], timeout=120)
     if rc != 0:
         return ['(open PRs unavailable: %s)' % (e.strip().splitlines() or ['?'])[-1][:120]], []
     prs = json.loads(o)
@@ -137,9 +145,9 @@ def other_open_prs(repo, number, head_sha, base_ref, files, new_digests, git_ok)
     if not found:
         return ['(%d other open PRs, none touch these files)' % (len(prs) - 1)], []
     base_sha = merged = None
+    local = set()
     if git_ok:
-        if run(['git', 'cat-file', '-e', head_sha + '^{commit}'], timeout=10)[0] != 0:
-            fetch_pr_head(number)
+        local = fetch_pr_heads(dict([(number, head_sha)] + [(f['pr']['number'], f['pr']['headRefOid']) for f in found]))
         rc, o, _ = run(['git', 'rev-parse', 'origin/' + base_ref], timeout=10)
         base_sha = o.strip() if rc == 0 else None
         merged = merged_base(base_sha, head_sha) if base_sha else None
@@ -147,7 +155,7 @@ def other_open_prs(repo, number, head_sha, base_ref, files, new_digests, git_ok)
     for f in found:
         p = f['pr']
         who = (p.get('author') or {}).get('login', '?')
-        head = fetch_pr_head(p['number']) if git_ok else None
+        head = p['headRefOid'] if p['number'] in local else None
         parts = []
         if f['shared']:
             parts.append('shares %s' % ', '.join(f['shared']))

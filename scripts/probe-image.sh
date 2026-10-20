@@ -15,4 +15,4 @@ while [[ $# -gt 0 ]]; do
     *) args+=("$1"); shift ;;
   esac
 done
-exec "$(dirname "$(realpath "$0")")/../bin/depledger" probe --no-bank "${args[@]}"
+exec "$(dirname "$(realpath "$0")")/../bin/depledger" probe --no-bank ${args[@]+"${args[@]}"}
