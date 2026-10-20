@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import subprocess
 import unittest
@@ -19,7 +20,7 @@ class CliTest(LedgerTestCase):
             if cwd:
                 os.chdir(cwd)
             cli.sys.stdin = io.StringIO(stdin)
-            with contextlib.redirect_stdout(out), mock.patch.object(cli, 'refresh_pr_states', return_value=[]):
+            with contextlib.redirect_stdout(out), mock.patch.object(cli, 'refresh_pr_states', return_value={}):
                 cli.main(list(argv))
         finally:
             os.chdir(old_cwd)
@@ -75,6 +76,32 @@ class CliTest(LedgerTestCase):
         self.assertIn('export/reviews.jsonl', committed)
         self.assertNotIn('test.db', committed)
         self.assertIn('nothing to back up', second)
+
+    def test_pr_states_refresh_asks_only_about_prs_not_merged_yet_in_one_query(self):
+        with store.write(self.conn):
+            web = store.ensure_repo(self.conn, 'acme/web')
+            store.upsert_pr(self.conn, web, 7, state='MERGED')
+            store.upsert_pr(self.conn, web, 8, state='OPEN')
+            store.upsert_pr(self.conn, web, 9)
+        reply = {'data': {'r0': {'p8': {'state': 'MERGED', 'mergedAt': '2026-10-19T03:04:05Z'}, 'p9': {'state': 'OPEN', 'mergedAt': None}}}}
+
+        with mock.patch.object(cli.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(reply), '')) as run:
+            changed = cli.refresh_pr_states(self.conn, [store.find_repo(self.conn, 'acme/web')])
+
+        query = run.call_args.args[0][-1]
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('p8: pullRequest(number: 8)', query)
+        self.assertNotIn('number: 7', query)
+        self.assertEqual(changed, {'acme/web': [(8, 'OPEN', 'MERGED'), (9, None, 'OPEN')]})
+        self.assertEqual(store.get_pr(self.conn, web, 8)['merged_at'], '2026-10-19T03:04:05Z')
+
+    def test_pr_states_refresh_makes_no_call_when_every_recorded_pr_is_merged(self):
+        with store.write(self.conn):
+            store.upsert_pr(self.conn, store.ensure_repo(self.conn, 'acme/web'), 7, state='MERGED')
+
+        with mock.patch.object(cli.subprocess, 'run') as run:
+            self.assertEqual(cli.refresh_pr_states(self.conn, [store.find_repo(self.conn, 'acme/web')]), {'acme/web': []})
+        run.assert_not_called()
 
     def test_parse_remote_and_pr_refs(self):
         self.assertEqual(repo.parse_remote('git@github.com:acme/api.git'), 'acme/api')

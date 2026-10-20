@@ -81,9 +81,11 @@ class CompareTest(LedgerTestCase):
 
 class ProbePairsTest(LedgerTestCase):
 
-    def run_pairs(self, pairs, results, **kw):
+    def run_pairs(self, pairs, results, picked='linux/amd64', **kw):
         out = io.StringIO()
-        with mock.patch.object(probe, 'run_probe', side_effect=lambda ref, *a: dict(results[ref], ref=ref)) as run, \
+        with mock.patch.dict(os.environ, {'DEPLEDGER_PROBE_DIR': self.tmp.name}), \
+                mock.patch.object(probe, 'pick_platform', return_value=picked) as self.pick, \
+                mock.patch.object(probe, 'run_probe', side_effect=lambda ref, *a: dict(results[ref], ref=ref)) as run, \
                 contextlib.redirect_stdout(out):
             failures = probe.probe_pairs(self.conn, pairs, **kw)
         return out.getvalue(), failures, run
@@ -135,6 +137,31 @@ class ProbePairsTest(LedgerTestCase):
         self.assertIn('PROBE FAILED %s: exit 1' % NEW, out)
         self.assertEqual(store.find_digest(self.conn, 'b' * 12), [])
 
+    def test_both_sides_run_on_the_platform_triage_read_without_asking_the_registry(self):
+        _, failures, run = self.run_pairs([('ghcr.io/acme/php:php8.4', OLD, NEW, 'linux/arm64')], {OLD: dump(CADDY_OLD), NEW: dump(CADDY_OLD)})
+
+        self.assertEqual(failures, 0)
+        self.assertEqual(sorted(c.args for c in run.call_args_list), [(OLD, 'linux/arm64', False), (NEW, 'linux/arm64', False)])
+        self.pick.assert_not_called()
+
+    def test_an_unreadable_manifest_fails_the_pair_instead_of_probing_the_host_platform(self):
+        out, failures, run = self.run_pairs([('ghcr.io/acme/php:php8.4', OLD, NEW)], {}, picked=None)
+
+        self.assertEqual(failures, 1)
+        run.assert_not_called()
+        self.assertIn('could not read the manifest to choose a platform', out)
+
+    def test_a_cached_dump_answers_without_docker_or_the_registry(self):
+        with open(os.path.join(self.tmp.name, '%s_linux-amd64.txt' % ('b' * 64)), 'w') as f:
+            f.write(CADDY_OLD)
+
+        with mock.patch.dict(os.environ, {'DEPLEDGER_PROBE_DIR': self.tmp.name}), \
+                mock.patch.object(probe.subprocess, 'run', side_effect=AssertionError('no subprocess for a cached digest')):
+            result = probe.run_probe(NEW)
+
+        self.assertEqual(result['platform'], 'linux/amd64')
+        self.assertEqual(probe.normalise(result['raw'])['php'], '8.4.26')
+
     def test_triage_pairs_carry_full_refs_and_an_untagged_image(self):
         images = {'redis': {'name': 'redis', '-': {'tag': '', 'digest': 'a' * 64}, '+': {'tag': '', 'digest': 'b' * 64}},
                   'valkey/valkey:9.2-alpine': {'name': 'valkey/valkey', '-': {'tag': '9.1-alpine', 'digest': 'c' * 64},
@@ -144,6 +171,14 @@ class ProbePairsTest(LedgerTestCase):
             {'label': 'redis', 'old': 'redis@sha256:' + 'a' * 64, 'new': 'redis@sha256:' + 'b' * 64},
             {'label': 'valkey/valkey:9.2-alpine', 'old': 'valkey/valkey:9.1-alpine@sha256:' + 'c' * 64,
              'new': 'valkey/valkey:9.2-alpine@sha256:' + 'd' * 64}])
+
+    def test_triage_pairs_carry_the_platform_it_read(self):
+        images = {'redis': {'name': 'redis', '-': {'tag': '', 'digest': 'a' * 64}, '+': {'tag': '', 'digest': 'b' * 64}},
+                  'timescale/timescaledb-ha:pg17': {'name': 'timescale/timescaledb-ha', '+': {'tag': 'pg17', 'digest': 'c' * 64}}}
+
+        pairs = probe.pairs_from_images(images, {'redis': 'linux/amd64'})
+
+        self.assertEqual([(p['label'], p.get('platform')) for p in pairs], [('redis', 'linux/amd64'), ('timescale/timescaledb-ha:pg17', None)])
 
 
 class ImageEditTest(LedgerTestCase):

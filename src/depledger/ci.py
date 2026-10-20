@@ -134,13 +134,18 @@ def conflict_with(base_sha, merged_sha, other_sha, cwd=None):
     return ('stale', before) if before else ('clean', [])
 
 
-def other_open_prs(repo, number, head_sha, base_ref, files, new_digests, git_ok):
-    """Lines for the 'Other open PRs' section, plus the numbers of PRs this one conflicts with."""
+def list_open_prs(repo):
+    """(the repo's open PRs with their files, None), or (None, the line to print instead)."""
     rc, o, e = run(['gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '60',
                     '--json', 'number,title,author,headRefName,headRefOid,files,isDraft'], timeout=120)
     if rc != 0:
-        return ['(open PRs unavailable: %s)' % (e.strip().splitlines() or ['?'])[-1][:120]], []
-    prs = json.loads(o)
+        return None, '(open PRs unavailable: %s)' % (e.strip().splitlines() or ['?'])[-1][:120]
+    return json.loads(o), None
+
+
+def other_open_prs(prs, number, head_sha, base_ref, files, new_digests, git_ok):
+    """Lines for the 'Other open PRs' section, plus the numbers of PRs this one conflicts with.
+    prs: the repo's open PRs, from list_open_prs()."""
     found = overlapping(prs, number, files, new_digests)
     if not found:
         return ['(%d other open PRs, none touch these files)' % (len(prs) - 1)], []

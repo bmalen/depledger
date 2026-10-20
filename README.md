@@ -109,19 +109,22 @@ and `--here` runs on whatever is checked out for a baseline.
 
 ### Image probes
 
-Triage writes every image change as full old and new refs to `probes.json` in its `--out` dir.
-`depledger probe --from <dir>` skips each pair whose new digest is already on record, runs the
-rest in parallel (`docker run` with a POSIX `sh` script, amd64 first), and prints one block per
+Triage writes every image change as full old and new refs to `probes.json` in its `--out` dir,
+with the platform it read from the manifests (amd64 first). `depledger probe --from <dir>` skips
+each pair whose new digest is already on record, runs the rest in parallel on that platform
+(`docker run` with a POSIX `sh` script), and prints one block per
 image: a class (`IDENTICAL`, `REBUILD ONLY`, `PACKAGE REFRESH`, `VERSION MOVE`), the runtime and
 Postgres extension versions that moved, and the PHP module and dpkg/apk/rpm package deltas. Both
 digests are banked with the same fact keys every time, the new one with the delta as its notes.
-Dumps are cached by digest under `<data dir>/probes` (`DEPLEDGER_PROBE_DIR`), so a digest is pulled
-once per machine. `depledger probe <old-ref> <new-ref>` does one pair, `--no-bank` probes digests
+Dumps are cached by digest and platform under `<data dir>/probes` (`DEPLEDGER_PROBE_DIR`), so a
+digest is pulled once per machine, and a pair with both dumps cached needs neither Docker nor the
+registry. `depledger probe <old-ref> <new-ref>` does one pair, `--no-bank` probes digests
 on record too and writes nothing, and `scripts/probe-image.sh` is a print-only wrapper around it.
 
 ## Web UI
 
-`depledger ui` starts a read-only Bun server on `127.0.0.1:7420` (change it with `DEPLEDGER_UI_PORT`).
+`depledger ui` starts a read-only Bun server on `127.0.0.1:7420` (change it with `DEPLEDGER_UI_PORT`),
+serving a minified production build; `bun server.ts` in `ui/` keeps hot reload for working on it.
 It shows open dependency PRs across every registered repo next to their verdicts, packages with
 their history across repos, repo notes, reviews, traps and patterns, digests, action pins and search.
 

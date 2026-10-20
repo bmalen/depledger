@@ -6,6 +6,7 @@ the new side of the previous PR) costs no pull. Facts are normalised to the same
 and banked in image_digests, so the next triage anywhere prints them instead of asking for a probe.
 """
 import datetime
+import glob
 import json
 import os
 import re
@@ -132,12 +133,14 @@ def package_map(lines):
 
 
 def pick_platform(ref):
+    """amd64, then arm64, then the first platform in the ref's manifest list; '' for a
+    single-manifest image; None when the manifest cannot be read."""
     try:
         raw = subprocess.run(['docker', 'buildx', 'imagetools', 'inspect', ref, '--raw'],
                              capture_output=True, text=True, timeout=60).stdout
         manifests = json.loads(raw).get('manifests', [])
     except (ValueError, subprocess.SubprocessError, OSError):
-        return ''
+        return None
     plats = ['%s/%s' % (m['platform']['os'], m['platform']['architecture'])
              for m in manifests if m.get('platform', {}).get('os') not in (None, 'unknown')]
     for want in ('linux/amd64', 'linux/arm64'):
@@ -146,10 +149,32 @@ def pick_platform(ref):
     return plats[0] if plats else ''
 
 
+def cached_platform(digest):
+    """The platform of a dump already cached for this digest (amd64, then arm64, then any), or None."""
+    found = [os.path.basename(p)[len(digest) + 1:-len('.txt')] for p in glob.glob(os.path.join(probe_dir(), digest + '_*.txt'))]
+    for want in ('linux-amd64', 'linux-arm64') + tuple(sorted(found)):
+        if want in found:
+            return '' if want == 'default' else want.replace('-', '/')
+    return None
+
+
+def choose_platform(ref, platform=None):
+    """The platform to probe a ref on: the one given, else that of a dump already cached for its
+    digest (no registry call), else the manifest's. None when the manifest cannot be read, so a
+    probe never silently runs on the host's own platform (arm64 on a Mac) instead."""
+    if platform is not None:
+        return platform
+    cached = cached_platform(parse_ref(ref)[2])
+    return cached if cached is not None else pick_platform(ref)
+
+
 def run_probe(ref, platform=None, refresh=False):
-    """{'ref', 'platform', 'raw', 'packages', 'dump'} or {'ref', 'error'}. Cached by digest+platform."""
+    """{'ref', 'platform', 'raw', 'packages', 'dump'} or {'ref', 'error'}. Cached by digest+platform.
+    platform: as choose_platform() takes it; '' runs on the default platform."""
     _, _, digest = parse_ref(ref)
-    plat = platform or pick_platform(ref)
+    plat = choose_platform(ref, platform)
+    if plat is None:
+        return {'ref': ref, 'error': 'could not read the manifest to choose a platform (pass --platform)'}
     os.makedirs(probe_dir(), exist_ok=True)
     dump_path = os.path.join(probe_dir(), '%s_%s.txt' % (digest, (plat or 'default').replace('/', '-')))
     if refresh or not os.path.exists(dump_path):
@@ -241,20 +266,29 @@ def fact_line(facts):
 
 
 def probe_pairs(conn, pairs, platform=None, refresh=False, do_bank=True, workers=4):
-    """pairs: [(label, old_ref or None, new_ref)]. Prints one block per pair and returns the
-    number of failed probes. When banking, a pair whose new digest is already on record is skipped."""
+    """pairs: [(label, old_ref or None, new_ref)], optionally with a fourth item, the platform
+    triage read from the manifests. Prints one block per pair and returns the number of failed
+    probes. When banking, a pair whose new digest is already on record is skipped."""
     todo, failures = [], 0
-    for label, old, new in pairs:
+    for pair in pairs:
+        label, old, new = pair[:3]
         hits = store.find_digest(conn, parse_ref(new)[2])
         if hits and do_bank and not refresh:
             print('### %s  pass (ledger): %s' % (label, fact_line(json.loads(hits[0]['facts'] or '{}')) or hits[0]['notes']))
         else:
-            todo.append((label, old, new))
-    refs = list(dict.fromkeys(r for _, o, n in todo for r in (o, n) if r))
+            todo.append((label, old, new, platform if platform is not None else (pair[3] if len(pair) > 3 else None)))
+    # Both sides of a pair run on one platform, chosen from the new side, so the delta never
+    # compares an amd64 dump with an arm64 one.
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = dict(zip(refs, ex.map(lambda r: run_probe(r, platform, refresh), refs)))
-    for label, old, new in todo:
-        o, n = results.get(old) if old else None, results[new]
+        plats = list(ex.map(lambda t: choose_platform(t[2], t[3]), todo))
+    refs = list(dict.fromkeys((r, plat) for (_, o, n, _), plat in zip(todo, plats) if plat is not None for r in (o, n) if r))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = dict(zip(refs, ex.map(lambda rp: run_probe(rp[0], rp[1], refresh), refs)))
+    for (label, old, new, _), plat in zip(todo, plats):
+        if plat is None:
+            o, n = None, {'ref': new, 'error': 'could not read the manifest to choose a platform (pass --platform)'}
+        else:
+            o, n = results.get((old, plat)) if old else None, results[(new, plat)]
         _, _, nd = parse_ref(new)
         print('### %s  %s -> %s  (%s)' % (label, parse_ref(old)[2][:12] if old else '-', nd[:12], n.get('platform', '?')))
         errors = [r for r in (o, n) if r and r.get('error')]
@@ -288,8 +322,10 @@ def probe_pairs(conn, pairs, platform=None, refresh=False, do_bank=True, workers
     return failures
 
 
-def pairs_from_images(images):
-    """Probe list for triage: [{'label', 'old', 'new'}] with full refs, from parse.image_changes output."""
+def pairs_from_images(images, platforms=None):
+    """Probe list for triage: [{'label', 'old', 'new'}] with full refs, from parse.image_changes output.
+    platforms: {key: platform} triage read from the manifests, carried as 'platform' so the probe
+    runs both sides on it without asking the registry again ('' is a single-manifest image)."""
     out = []
     for key, v in sorted(images.items()):
         o, n = v.get('-', {}), v.get('+', {})
@@ -298,5 +334,8 @@ def pairs_from_images(images):
 
         def ref(side):
             return '%s%s@sha256:%s' % (v.get('name', key), (':' + side['tag']) if side.get('tag') else '', side['digest'])
-        out.append({'label': key, 'old': ref(o) if o.get('digest') else None, 'new': ref(n)})
+        pair = {'label': key, 'old': ref(o) if o.get('digest') else None, 'new': ref(n)}
+        if platforms and key in platforms:
+            pair['platform'] = platforms[key]
+        out.append(pair)
     return out

@@ -427,7 +427,7 @@ def cmd_probe(conn, a):
         if not os.path.exists(path):
             fail('%s not found: run `depledger triage <pr> --out %s` first' % (path, a.from_dir))
         with open(path) as f:
-            pairs = [(p['label'], p['old'], p['new']) for p in json.load(f)]
+            pairs = [(p['label'], p['old'], p['new'], p.get('platform')) for p in json.load(f)]
     elif len(a.refs) == 1:
         pairs = [(a.refs[0].rsplit('@', 1)[0], None, a.refs[0])]
     elif len(a.refs) == 2:
@@ -501,7 +501,7 @@ def cmd_review_save(conn, a):
                                           tier=a.tier, title=a.title, body=body.strip('\n') + '\n', head_sha=a.head)
     print('%s review r%s for %s#%s (%s)' % ('replaced' if replaced else 'saved', rid, r['full_name'], number, verdict_label(verdict)))
     try:
-        changed = refresh_pr_states(conn, r)
+        changed = refresh_pr_states(conn, [r]).get(r['full_name'], [])
         if changed:
             print('PR states refreshed: %s' % ', '.join('#%s %s' % (n, new.lower()) for n, _old, new in changed))
     except Exception as e:  # noqa: the review is saved; a stale PR state is not worth failing for
@@ -510,36 +510,59 @@ def cmd_review_save(conn, a):
         print('view: http://127.0.0.1:%d/reviews/%s' % (UI_PORT, rid))
 
 
-def refresh_pr_states(conn, repo_row):
-    """Bring the recorded PRs of one repo up to date (open, merged, closed) with one gh call.
-    Returns the PRs whose state changed."""
-    out = subprocess.run(['gh', 'pr', 'list', '--repo', repo_row['full_name'], '--state', 'all', '--limit', '500',
-                          '--json', 'number,state,mergedAt'], capture_output=True, text=True, timeout=90)
-    if out.returncode != 0:
-        raise store.StoreError('gh pr list failed for %s: %s' % (repo_row['full_name'], out.stderr.strip()[:160]))
-    live = dict((p['number'], p) for p in json.loads(out.stdout))
-    changed = []
+def refresh_pr_states(conn, repo_rows):
+    """Bring the recorded PRs that are not merged yet (open, closed or never synced) up to date
+    with one GitHub query across these repos; a merged PR stays merged, so it is never asked
+    about again. Returns {full_name: [(number, old state, new state)]} for every repo the query
+    read, and raises StoreError when it read nothing."""
+    pending = {}
+    for r in repo_rows:
+        pending[r['full_name']] = (r, store.rows(conn.execute(
+            "SELECT * FROM prs WHERE repo_id = ? AND (state IS NULL OR state != 'MERGED') ORDER BY number", (r['id'],))))
+    asked = [(i, r, prs) for i, (r, prs) in enumerate(pending.values()) if prs]
+    if not asked:
+        return dict((name, []) for name in pending)
+    query = '{ %s }' % ' '.join(
+        'r%d: repository(owner: %s, name: %s) { %s }' % (
+            i, json.dumps(r['full_name'].split('/')[0]), json.dumps(r['full_name'].split('/')[1]),
+            ' '.join('p%d: pullRequest(number: %d) { state mergedAt }' % (pr['number'], pr['number']) for pr in prs))
+        for i, r, prs in asked)
+    out = subprocess.run(['gh', 'api', 'graphql', '-f', 'query=' + query], capture_output=True, text=True, timeout=90)
+    try:
+        data = json.loads(out.stdout).get('data') or {}
+    except ValueError:
+        data = {}
+    if not data:
+        raise store.StoreError('gh api graphql failed: %s' % (out.stderr.strip() or out.stdout.strip())[:160])
+    result = dict((name, []) for name, (_r, prs) in pending.items() if not prs)
     with store.write(conn):
-        for pr in store.rows(conn.execute('SELECT * FROM prs WHERE repo_id = ?', (repo_row['id'],))):
-            p = live.get(pr['number'])
-            if p and (p['state'] != pr['state'] or (p.get('mergedAt') or None) != pr['merged_at']):
-                store.upsert_pr(conn, repo_row['id'], pr['number'], state=p['state'], merged_at=p.get('mergedAt'), synced_at=store.now())
-                changed.append((pr['number'], pr['state'], p['state']))
-    return changed
+        for i, r, prs in asked:
+            live = data.get('r%d' % i)
+            if live is None:
+                continue
+            changed = result[r['full_name']] = []
+            for pr in prs:
+                p = live.get('p%d' % pr['number'])
+                if p and (p['state'] != pr['state'] or (p.get('mergedAt') or None) != pr['merged_at']):
+                    store.upsert_pr(conn, r['id'], pr['number'], state=p['state'], merged_at=p.get('mergedAt'), synced_at=store.now())
+                    changed.append((pr['number'], pr['state'], p['state']))
+    return result
 
 
 def cmd_review_sync(conn, a):
     """Refresh PR state (open, merged, closed) from GitHub."""
     repos = [repo_mod.resolve(conn, a.repo)] if a.repo else store.list_repos(conn)
+    try:
+        changed = refresh_pr_states(conn, repos)
+    except store.StoreError as e:
+        fail(str(e))
     for r in repos:
-        try:
-            changed = refresh_pr_states(conn, r)
-        except store.StoreError as e:
-            print('skip %s' % e)
+        if r['full_name'] not in changed:
+            print('skip %s: GitHub did not return it' % r['full_name'])
             continue
-        for number, old, new in changed:
+        for number, old, new in changed[r['full_name']]:
             print('%s#%s %s -> %s' % (r['full_name'], number, old or '?', new))
-        print('%s: %d changed' % (r['full_name'], len(changed)))
+        print('%s: %d changed' % (r['full_name'], len(changed[r['full_name']])))
 
 
 # ---------------------------------------------------------------- ui and export
@@ -574,7 +597,9 @@ def cmd_ui(conn, a):
             subprocess.run([bun, 'install', '--frozen-lockfile'], cwd=ui_dir, check=True)
         log_path = os.path.join(store.data_dir(), 'ui.log')
         log = open(log_path, 'a')
-        env = dict(os.environ, DEPLEDGER_DB=store.db_path(), DEPLEDGER_UI_PORT=str(a.port))
+        # Production mode: a minified bundle with React's production build. `bun server.ts` run by
+        # hand keeps development mode (hot reload) for working on the UI.
+        env = dict(os.environ, DEPLEDGER_DB=store.db_path(), DEPLEDGER_UI_PORT=str(a.port), NODE_ENV='production')
         proc = subprocess.Popen([bun, 'server.ts'], cwd=ui_dir, stdout=log, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True, env=env)
         with open(pid_path, 'w') as f:
